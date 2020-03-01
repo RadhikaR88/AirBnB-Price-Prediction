@@ -1,0 +1,545 @@
+---
+title: "AML Project: AirBnB (New York) Dataset"
+author:
+- "Radhika Rajeevan"
+- "Sunit Nair"
+date: "12/12/2019"
+abstract:
+  The project aims to analyze the AirBnB data set available at OpenDataSoft and apply techniques learned as part of the course and some additional methods to predict the price that a new property should expect to charge based on its features. The data for New York City was extracted and used for the purpose of this project. Analysis, filtering, and extraction of categorical variables from the data set was done using Python. The combined, cleansed data file was loaded into a database (MySQL) from where it is read for regression. Extraction of derived columns and running the regression models was performed in R and the following methods were used- Linear Regression, Tree, Ridge/Lasso Regression, and XGBoost. Validation set and k-fold cross validation techniques are used. The output of the predicted prices (for data without prices in data set) is written to a CSV file at the end.
+output: word_document
+instructor: Dr. Farid Alizadeh
+course: Algorithmic Machine Learning
+---
+
+The required packages need to installed. Please uncomment any packages that are not installed to make sure the program runs successfully.
+
+```{r}
+print("Installing required packages")
+#install.packages("RMySQL")
+#install.packages("MASS")
+#install.packages("tidyverse")
+#install.packages("glmnet")
+#install.packages("tree")
+#install.packages("xgboost")
+#install.packages("caret")
+
+library(RMySQL)
+library(MASS)
+library(tidyverse)
+library(glmnet)
+library(tree)
+library(xgboost)
+library(caret)
+```
+
+The data is available as a CSV file and was loaded into MySQL database for this project. The user can choose to read from either source. For the purpose of this markdown, we read from the CSV file.
+
+The regression models can be run with price or log of price (which has distribution closer to normal).
+The variable log_regression controls this feature and is set to FALSE for the purpose of this markdown.
+
+```{r}
+print("NOTE: The data set is available as a cleaned CSV file and was loaded into MySQL database for this project")
+read_from <- 0
+r_user <- "r_user"
+r_password <- "r_password"
+db_name <- "aml"
+log_regression <- FALSE
+if(as.integer(read_from)==1){
+  print(paste("Connecting to database with user",r_user))
+  mydb <- dbConnect(MySQL(), user=r_user, password=r_password, dbname=db_name, host="localhost")
+  print(paste("Showing list of tables available in schema",db_name))
+  tableNames <- dbListTables(mydb)
+  print(tableNames)
+  print(paste("Checking columns in table",tableNames[1]))
+  colNames <- dbListFields(mydb, tableNames[1])
+  print(colNames)
+  print(paste("Fetching all data from ",tableNames[1]))
+  tableQuery <- paste("SELECT * FROM ",db_name,".",tableNames[1],sep="")
+  resultSet <- dbSendQuery(mydb, tableQuery)
+  airData <- fetch(resultSet,n=-1)
+  dbDisconnect(mydb)
+} else {
+  if(as.integer(read_from)==0){
+    print("Reading from CSV")
+  } else{
+    print("Invalid input, defaulting to reading from CSV")
+  }
+  airData <- read.csv("final_project.csv")
+}
+```
+
+Dimensions of airData.
+
+```{r}
+print("Dimensions of airData:")
+print(dim(airData))
+```
+
+Changing boolean columns to integer (0/1) columns so as to later convert them to factors.
+
+```{r}
+print("Converting boolean columns to integers")
+airData[,31:130] <- lapply(airData[,31:130],as.integer)
+```
+
+Deriving new features:
+1. featureCount: Number of 0/1 features provided by each listing.
+2. yearsAsHost: (2019 - first year as host)
+
+```{r}
+print("Deriving new features from data set")
+print("Deriving number of features as numerical feature")
+airData$featureCount <- apply(airData[,31:130],1,sum)
+print("Deriving yearAsHost as numerical feature")
+airData$yearsAsHost <- (2019 - airData$hostYear)
+```
+
+Converting categorical columns to factors.
+
+```{r}
+print("Converting categorical columns to factors")
+airData[,31:130] <- lapply(airData[,31:130],as.factor)
+airData$neighbourhoodCleansed <- as.factor(airData$neighbourhoodCleansed)
+airData$neighbourhoodGroupCleansed <- as.factor(airData$neighbourhoodGroupCleansed)
+airData$bedType <- as.factor(airData$bedType)
+airData$cancellationPolicy <- as.factor(airData$cancellationPolicy)
+airData$propertyType <- as.factor(airData$propertyType)
+airData$roomType <- as.factor(airData$roomType)
+airData <- as.data.frame(airData)
+```
+
+Summary of airData after above manipulations.
+
+```{r}
+print("Summary of airData:")
+print(summary(airData))
+```
+
+Dropping columns that have been used to derive other columns, have repeated information or have low count which may cause issues when training and test data sets have different levels.
+
+```{r}
+print("Dropping columns from airData that have been used to derive other columns, have repeated information, or have low count for certain levels")
+dropColumns <- c("id","hostYear","accessibleHeightToilet","BBQgrill","babyBath","babyMonitor","babySitterRecommendations","bathTub","bedLinens","breakfast","changingTable","cats","childrenBooksAndToys","childrenDinnerware","cleaningBeforeCheckout","coffeemaker","cookingBasics","crib","dishesAndSilverware","dishwasher","dogs","doormanEntry","extraPillowsBlankets","fireplaceGuards","freeParkingOnStreet","gameConsole","gardenOrBackyard","railsInShowerToilet","highchair","hotwater","indoorFireplace","keypad","lockbox","longTermStaysAllowed","luggageDropOffAllowed","microwave","otherPets","outletCovers","oven","packNPlayTravelCrib","pathToEntranceLitAtNight","patioOrBalcony","privateBathroom","privatEentrance","privateLivingRoom","refrigerator","shades","safetyCard","smartlock","stairGates","stepFreeaccess","stove","suitableForEvents","tableCornerGuards","washerDryer","wideClearanceToBed","wideClearanceShowerToilet","wideDoorway","wideHallwayClearance","windowGuards","hosting_amenity_49","hosting_amenity_50")
+airDataClean <- airData[,!(names(airData) %in% dropColumns)]
+airDataClean <- as.data.frame(airDataClean)
+```
+
+Column names in cleaned data set.
+
+```{r}
+print("Columns in cleaned airData set")
+print(names(airDataClean))
+```
+
+Clubbing infrequent neighborhoods into 'Other' cateory so as to reduce the probability of issues caused due to different levels in training and test data sets.
+
+```{r}
+print("Clubbing infrequent neighborhoods into 'Other' category")
+neighborhoodList <- unique(airDataClean$neighbourhoodCleansed)
+
+print("Converting column as character to replace with Other")
+airDataClean$neighbourhoodCleansed <- as.character(airDataClean$neighbourhoodCleansed)
+print("Neighborhood summary before cleansing")
+print(summary(airDataClean$neighbourhoodCleansed))
+
+print("Clubbing infrequent neighborhoods into 'Other'")
+for(n in neighborhoodList)
+{
+  tempList <- airDataClean$neighbourhoodCleansed == n
+  rcount <- length(which(tempList))
+  print(paste(n,":",rcount))
+  if(rcount <= 300){
+    print(paste("Changing ",n," to Other"))
+    airDataClean$neighbourhoodCleansed[tempList] <- "Other"
+  }
+}
+
+print("Converting neighborhood as factor post-clubbing")
+airDataClean$neighbourhoodCleansed <- as.factor(airDataClean$neighbourhoodCleansed)
+
+print("Summary of neighborhood column post clubbing")
+print(summary(airDataClean$neighbourhoodCleansed))
+```
+
+Extract data without price information as data set to predict on at the end.
+
+```{r}
+print("Extract data without price as predict data set")
+airDataPredict <- airDataClean[airDataClean$price == 0,]
+print(paste("Number of rows in airDataPredict:",nrow(airDataPredict)))
+```
+
+Extract data set with valid price information to use for biulding training and test data sets.
+
+```{r}
+print("Extract valid data with price as actual data set")
+airDataValid <- airDataClean[airDataClean$price > 0,]
+print(paste("Number of rows in airDataValid:",nrow(airDataValid)))
+```
+
+Log transform price if required.
+
+```{r}
+if(log_regression){
+  airDataValid$price <- log(airDataValid$price)
+}
+```
+
+Create training and sample tests by sampling 95% of data for training set and 5% for test set.
+
+```{r}
+print("Creating sample training set and test sets")
+train <- sample(1:nrow(airDataValid),0.95*nrow(airDataValid))
+airDataTrain <- airDataValid[train,]
+airDataTest <- airDataValid[-train,]
+```
+
+Linear Regression: Price vs Everything.
+
+```{r}
+print("Running Linear Regression Model: Price vs Everything")
+lm1 <- lm(price~.,data=airDataTrain)
+print("Summary of Linear Regression")
+print(summary(lm1))
+print("Using Linear Regression Model for prediction")
+print("WARNING!!!: This step may fail in case the training set and test set have different levels. If this occurs, re-running the code usually fixes it.")
+lm1Pred <- predict(lm1, airDataTest)
+print(paste("Test MSE:",mean((airDataTest$price - lm1Pred) ^ 2)))
+```
+
+Running Principal Component Analysis in numerical features to analyze factor loading of each against first 3 PCs.
+
+```{r}
+print("Running PCA on numerical features")
+pcaDF <- data.frame(cbind(hostResponseHours=airDataValid$hostResponseHours,accommodates=airDataValid$accommodates,bathrooms=airDataValid$bathrooms,bedrooms=airDataValid$bedrooms,beds=airDataValid$beds,TV=airDataValid$TV,cleaningFee=airDataValid$cleaningFee,extraPeople=airDataValid$extraPeople,guestsIncluded=airDataValid$guestsIncluded,maximumNights=airDataValid$maximumNights,minimumNights=airDataValid$minimumNights,price=airDataValid$price,securityDeposit=airDataValid$securityDeposit,numberOfReviews=airDataValid$numberOfReviews,reviewScoresAccuracy=airDataValid$reviewScoresAccuracy,reviewScoresCheckin=airDataValid$reviewScoresCheckin,reviewScoresCleanliness=airDataValid$reviewScoresCleanliness,reviewScoresCommunication=airDataValid$reviewScoresCommunication,reviewScoresLocation=airDataValid$reviewScoresLocation,reviewScoresLocation=airDataValid$reviewScoresLocation,reviewScoresRating=airDataValid$reviewScoresRating,reviewScoresValue=airDataValid$reviewScoresValue,reviewsperMonth=airDataValid$reviewsperMonth))
+pcaModel <- prcomp(pcaDF,scale.=TRUE,center=TRUE)
+print("Summary of PCA Model")
+print(summary(pcaModel))
+print("Rotation Matrix of PCA Model")
+print(pcaModel$rotation)
+```
+
+Screeplot
+
+```{r}
+print("PCA Screeplot")
+screeplot(pcaModel, main="Variance of PCs")
+```
+
+Biplot: PC1 vs PC2
+
+```{r}
+print("Plotting Biplot: PC1 vs PC2 (Please wait till plot appears to continue)")
+biplot(pcaModel,choices = c(1,2))
+```
+
+Biplot: PC2 vs PC3
+
+```{r}
+print("Plotting Biplot: PC2 vs PC3 (Please wait till plot appears to continue)")
+biplot(pcaModel,choices = c(2,3))
+```
+
+Biplot: PC1 vs PC3
+
+```{r}
+print("Plotting Biplot: PC1 vs PC3 (Please wait till plot appears to continue)")
+biplot(pcaModel,choices = c(1,3))
+```
+
+Removing features with similar factor laodings to avoid issues like collinearity.
+
+```{r}
+print("Reviews per month and number of reviews have similar factor loadings as do all the individual review columns")
+print("Removing Reviews per month, the indiviudal review scores except Review score rating")
+dropColumns <- c("reviewsperMonth","reviewScoresAccuracy","reviewScoresCheckin","reviewScoresCleanliness","reviewScoresCommunication","reviewScoresLocation","reviewScoresValue")
+airDataValid <- airDataValid[,!(names(airDataValid) %in% dropColumns)]
+airDataValid <- as.data.frame(airDataValid)
+```
+
+Summary after removing features with similar factor loading.
+
+```{r}
+print("Summary after deletion of columns")
+print(summary(airDataValid))
+```
+
+Using K-fold validation on Linear Model to check if model still performs comparably after removing features based on PCA.
+The aim is to achieve close to same R-squared model with a muich smaller set of features.
+
+```{r}
+print("Retraining linear model with repeated k-fold cross validation")
+train.control <- trainControl(method="repeatedcv",number=10,repeats=3)
+lm2 <- train(price~.,data=airDataValid,method="lm",trControl=train.control)
+```
+
+Summary of K-fold model.
+
+```{r}
+print("Summary of Linear Regression")
+print(summary(lm2))
+print(lm2)
+```
+
+Removing features from Linear Model with high p-values.
+
+```{r}
+print("Removing features with high p-values in cross validated linear model")
+dropColumns <- c("hostResponseHours","neighbourhoodGroupCleansed","bedType","beds","extraPeople","maximumNights","checkIn24Hours","airConditioning","buzzerOrWirelessIntercom","dryer","familyAndKidFriendly","fireExtinguisher","firstAidKit","freeParkingOnPremises","hairdryer","hangers","heating","hottub","internet","iron","kitchen","laptopFriendlyWorkspace","lockOnBedroomDoor","petsLiveOnThisProperty","selfCheckIn","shampoo","smokingAllowed","washer","wirelessInternet","hostHasProfilePic","hostIdentityVerified","instantBookable","isLocationExact","requireGuestPhoneVerification","requireGuestProfilePicture","featureCount","yearsAsHost")
+airDataValid <- airDataValid[,!(names(airDataValid) %in% dropColumns)]
+airDataValid <- as.data.frame(airDataValid)
+```
+
+Summary of data set after removal of features.
+
+```{r}
+print("Summary after deletion of columns")
+print(summary(airDataValid))
+```
+
+Using K-fold validation on Linear Model to check if model still performs comparably after removing features based on p-values.
+The aim is to achieve close to same R-squared model with a muich smaller set of features.
+
+```{r}
+print("Retraining linear model with repeated k-fold cross validation")
+train.control <- trainControl(method="repeatedcv",number=10,repeats=3)
+lm3 <- train(price~.,data=airDataValid,method="lm",trControl=train.control)
+```
+
+Summary of K-fold model
+
+```{r}
+print("Summary of Linear Regression")
+print(summary(lm3))
+print(lm3)
+```
+
+Using Regression Tree to model price vs features.
+
+```{r}
+print("Creating Regression Tree for prediction")
+airTree <- tree(price~., data=airDataTrain)
+```
+
+Tree plot.
+
+```{r}
+print("Plotting Tree")
+plot(airTree)
+text(airTree,pretty=TRUE)
+```
+
+Tree-based prediction.
+
+```{r}
+print("Using Tree Model to predict for Test data")
+treePred <- predict(airTree, airDataTest)
+print(paste("Test MSE:",mean((airDataTest$price - treePred) ^ 2)))
+```
+
+Pruning tree to get best tree.
+
+```{r}
+print("Using Cross Validation to get Pruned Tree")
+cvtree <- cv.tree(airTree,FUN=prune.tree,K=10)
+```
+
+Pruning: Sizes considered
+
+```{r}
+print("Sizes considered:")
+print(cvtree$size)
+```
+
+Pruning: k-values considered
+
+```{r}
+print("Various alphas (k's) considered:")
+print(cvtree$k)
+```
+
+Pruning: misclassification rates for corresponding k-values
+
+```{r}
+print("Corresponding misclassification rates:")
+print(cvtree$dev)
+```
+
+Pruning: Plot of misclassification rate
+
+```{r}
+print("plot of misclassification rate:")
+plot.tree.sequence(cvtree)
+```
+
+Extracting best tree model.
+
+```{r}
+print("Extracting best tree from CV model")
+bestTree <- prune.tree(airTree, best=cvtree$size[which.min(cvtree$dev)])
+```
+
+Plotting best tree.
+
+```{r}
+print("Plotting best tree")
+plot(bestTree)
+text(bestTree,pretty=TRUE)
+```
+
+Using best tree for prediction on test data.
+
+```{r}
+print("Using Best Tree Model to predict for Test data")
+treePred2 <- predict(bestTree, airDataTest)
+print(paste("Test MSE:",mean((airDataTest$price - treePred2) ^ 2)))
+```
+
+Linear model with interaction.
+It is possible that the pricing of a listing in NYC is subjective and/or dependent on features not available in this set (like age of building, rent control etc.).
+It is also possible that the true relationship between price and some of the features in non-linear.
+Running a linear model with interaction or higher polynomial order might reveal these relationships.
+However, running a interaction model with even 27 variables for polynomial degree=2 takes prohibitively long time (~10 minutes).
+Running more complex models is not possible unless dedicated machines are available and/or time is not a constraint.
+The output of the quadratic model is pasted here for reference and there are indications that the relationship of price with at least some of these features may be non-linear.
+
+```{r}
+print("Linear Regression with interaction")
+#lmi <- lm(price~(.)^2,data=airDataTrain)
+#print(summary(lmi))
+#lmiPred <- predict(lmi,airDataTest)
+#print(mean((airDataTest$price - lmiPred) ^ 2))
+print("Linear Regression with interaction runs prohibitively long (~10 minutes for polynomial degree 2)")
+print("The output of the above commented code is pasted below for reference")
+print("**************************************************************")
+print("Residual standard error: 70.57 on 17072 degrees of freedom")
+print("Multiple R-squared:  0.684,	Adjusted R-squared:  0.6635")
+print("F-statistic: 33.27 on 1111 and 17072 DF,  p-value: < 2.2e-16")
+print("**************************************************************")
+print("This indicates that the relationship between price and othe features may be non-linear and/or there may be an interaction effect between certain features.")
+```
+
+Using data set with all columns for Ridge and Lasso regression.
+Recreating training and test data sets from this data set.
+
+```{r}
+print("Recreating training and test data sets with all columns in cleaned dataSet")
+airDataNew <- airDataClean[airDataClean$price > 0,]
+
+if(log_regression){
+  airDataNew$price <- log(airDataNew$price)
+}
+
+airDataTrain <- airDataNew[train,]
+airDataTest <- airDataNew[-train,]
+```
+
+glm (Ridge/Lasso/Elastic Net) requires data to be split into two objects: a model matrix with all features and a label object with the response.
+
+```{r}
+featureSet <- model.matrix(price~.,airDataTrain)[,-1]
+responseSet <- airDataTrain$price
+```
+
+Running Ridge regression model.
+
+```{r}
+print("Running Ridge Regression Model")
+print("Using Cross Validation to determine value of Shrinkage Parameter")
+cv <- cv.glmnet(featureSet, responseSet, alpha=0)
+minLambda <- cv$lambda.min
+print(paste("Min. Lambda determined: ",minLambda))
+ridgeModel <- glmnet(featureSet, responseSet, alpha=0, lambda=minLambda)
+print(summary(ridgeModel))
+print(coef(ridgeModel))
+ridgeTest <- model.matrix(price~.,airDataTest)[,-1]
+ridgePred <- predict(ridgeModel,ridgeTest)
+print(paste("RMSE:",RMSE(ridgePred, airDataTest$price)))
+print(paste("R-squared:",R2(ridgePred, airDataTest$price)))
+```
+
+Running LASSO regression model.
+
+```{r}
+print("Running Lasso Regression Model")
+print("Using Cross Validation to determine value of Shrinkage Parameter")
+cv <- cv.glmnet(featureSet, responseSet, alpha=1)
+minLambda <- cv$lambda.min
+print(paste("Min. Lambda determined: ",minLambda))
+lassoModel <- glmnet(featureSet, responseSet, alpha=1, lambda=minLambda)
+print(summary(lassoModel))
+print(coef(lassoModel))
+lassoTest <- model.matrix(price~.,airDataTest)[,-1]
+lassoPred <- predict(lassoModel,lassoTest)
+print(paste("RMSE:",RMSE(lassoPred, airDataTest$price)))
+print(paste("R-squared:",R2(lassoPred, airDataTest$price)))
+```
+
+XGBoost is a library designed and optimized for boosting trees algorithms. Gradient boosting trees model is originally proposed by Friedman et al. The underlying algorithm of XGBoost is similar, specifically it is an extension of the classic gbm algorithm. By employing multi-threads and imposing regularization, XGBoost is able to utilize more computational power and get more accurate prediction.
+XGBoost requires training and test data to be prepared similar to requirements of Ridge/Lasso regression models.
+
+```{r}
+print("Using XGBoost")
+print("Creating matrices for training and test data for XGBoost")
+xgbTestData <- model.matrix(price~.,airDataTest)[,-1]
+xgbPredData <- model.matrix(price~.,airDataPredict)[,-1]
+xgbTestLabel <- airDataTest$price
+```
+
+XGBoost can be used with caret to set up training controls for the cross validation approach.
+The xgbGrid definees the values or list/range of values for each parameter that needs to be estimated.
+An average CV run for XGBoost (2 parameters with 3 values each) runs for ~45-50 minutes.
+The values below were estimated during earlier test runs and have been fixed to provide optimum results and reduce runtime for the markdown.
+
+```{r}
+print("Setting up XGBoost Training Controls")
+xgb_trcontrol = trainControl(method="cv", number=5, allowParallel=TRUE, verboseIter=TRUE, returnData=FALSE)
+print("Setting up XGBoost Grid")
+xgbGrid <- expand.grid(nrounds=100, max_depth=10, colsample_bytree=0.5, eta=0.1, gamma=0, min_child_weight=50, subsample=0.9)
+xgb1 <- train(featureSet, responseSet, trControl=xgb_trcontrol, tuneGrid=xgbGrid, method="xgbTree")
+```
+
+Best tuning parameters.
+
+```{r}
+print("Best Tuning Parameters")
+print(xgb1$bestTune)
+```
+
+Summary of XGBoost model.
+
+```{r}
+print("Summary of XGBoost model")
+print(xgb1)
+```
+
+Using XGBoost model to predict on test data.
+
+```{r}
+print("Using XGBoost model to predict on Test Data")
+xgbPred <- predict(xgb1,xgbTestData)
+print(paste("RMSE:",RMSE(xgbPred, airDataTest$price)))
+print(paste("R-squared:",R2(xgbPred, airDataTest$price)))
+```
+
+Using XGBoost model for pure prediction.
+
+```{r}
+print("Using XGBoost model to predict on Unknown Data")
+xgbPred <- predict(xgb1,xgbPredData)
+airDataPredict$price <- xgbPred
+print("Printing head and tail for predicted data")
+print(head(airDataPredict))
+print(tail(airDataPredict))
+print("Writing predicted data to file predictedPrices.csv")
+
+if(log_regression){
+  airDataPredict$price <- exp(airDataPredict$price)
+}
+
+write.csv(airDataPredict,"predictedPrices.csv")
+
+print("---------- End of Algorithmic Machine Learning Project ----------")
+```
+
+End of Markdown.
