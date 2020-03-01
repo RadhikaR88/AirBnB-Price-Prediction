@@ -1,4 +1,4 @@
-# Price Prediction for AirBnB Rental listings (New York)
+# Price Prediction for AirBnB Rental listings (NYC)
 
 The project aims to analyze the AirBnB data set and intends to predict the price that a new property should expect to charge based on its features like location, capacity of occupancy, number of days to rent etc.
 
